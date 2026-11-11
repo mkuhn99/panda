@@ -131,7 +131,7 @@ def channels_tsv(f):
 # channel-name rules on top of the BIDS types, since some datasets type every PSG channel as EEG (nm000111: LOC-A2,
 # X1..X8, SaO2, DC3 ...) and some type nothing (on006695: N/A). Names are split into tokens at non-alphanumerics.
 NON_EEG = re.compile(r"^(H?V?EOG\w*|LOC|ROC|E1|E2|EMG\w*|CHIN\w*|ECG\w*|EKG\w*|SA?O2|SPO2|PLETH\w*|PULSE|HR|"
-                     r"RESP\w*|FLOW|AIRFLOW|PTAF|NASAL|CANNULA|PRESS\w*|THOR\w*|ABD\w*|SNORE|POS|POSITION|LEG\w*|"
+                     r"RESP\w*|FLOW|AIRFLOW|PTAF|NASAL|CANNULA|CAN|THER\w*|PRESS\w*|THOR\w*|ABD\w*|SNORE|POS|POSITION|LEG\w*|"
                      r"[LR]LEG|LAT|RAT|PLM\w*|DC\d+|X\d+|MIC|SOUND|LIGHT|BATT\w*|ACC\w*|GYRO\w*|AUX\w*|STATUS|TRIG\w*|"
                      r"EVENT|CO2|TEMP\w*|IMP\w*|PPG\w*|SPO2)$")
 # 10-20 / 10-10 / 10-05 electrode names (Fp1, AF7, TP9, Cz, FCC3h, ...), used when a dataset types no channel as EEG
@@ -147,9 +147,10 @@ REFERENCES = {"A1", "A2", "M1", "M2", "REF", "GND"}
 
 
 def non_eeg_name(name):
-    """Name marks another signal (EOG, EMG, ECG, SaO2, X1, ...) or is only a reference electrode (A1, M2)."""
+    """Name marks another signal (EOG, EMG, ECG, SaO2, X1, thermistor, cannula, ...) or is only a reference electrode
+    (A1, M2) or a bare number (nm000111's unlabelled channels 24-31)."""
     tok = name_tokens(name)
-    return any(NON_EEG.match(t) for t in tok) or (bool(tok) and all(t in REFERENCES for t in tok))
+    return any(NON_EEG.match(t) for t in tok) or (bool(tok) and all(t in REFERENCES or t.isdigit() for t in tok))
 
 
 def ten_twenty_name(name):
