@@ -50,6 +50,7 @@ import glob
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -127,14 +128,50 @@ def channels_tsv(f):
         d = os.path.dirname(d)
 
 
-def eeg_channels(f):
-    """Names of the good EEG channels of a recording from its channels.tsv; None if there is no channels.tsv."""
+# channel-name rules on top of the BIDS types, since some datasets type every PSG channel as EEG (nm000111: LOC-A2,
+# X1..X8, SaO2, DC3 ...) and some type nothing (on006695: N/A). Names are split into tokens at non-alphanumerics.
+NON_EEG = re.compile(r"^(H?V?EOG\w*|LOC|ROC|E1|E2|EMG\w*|CHIN\w*|ECG\w*|EKG\w*|SA?O2|SPO2|PLETH\w*|PULSE|HR|"
+                     r"RESP\w*|FLOW|AIRFLOW|PTAF|NASAL|CANNULA|PRESS\w*|THOR\w*|ABD\w*|SNORE|POS|POSITION|LEG\w*|"
+                     r"[LR]LEG|LAT|RAT|PLM\w*|DC\d+|X\d+|MIC|SOUND|LIGHT|BATT\w*|ACC\w*|GYRO\w*|AUX\w*|STATUS|TRIG\w*|"
+                     r"EVENT|CO2|TEMP\w*|IMP\w*|PPG\w*|SPO2)$")
+# 10-20 / 10-10 / 10-05 electrode names (Fp1, AF7, TP9, Cz, FCC3h, ...), used when a dataset types no channel as EEG
+TEN_TWENTY = re.compile(r"^(NZ|FP|AFP|AF|AFF|F|FFC|FFT|FT|FC|FCC|FTT|T|TTP|TP|C|CCP|CP|CPP|TPP|P|PPO|PO|POO|O|OI|I|IZ)"
+                        r"(Z|\d{1,2}H?)$")
+
+
+def name_tokens(name):
+    return [t for t in re.split(r"[^A-Z0-9]+", name.upper()) if t]
+
+
+REFERENCES = {"A1", "A2", "M1", "M2", "REF", "GND"}
+
+
+def non_eeg_name(name):
+    """Name marks another signal (EOG, EMG, ECG, SaO2, X1, ...) or is only a reference electrode (A1, M2)."""
+    tok = name_tokens(name)
+    return any(NON_EEG.match(t) for t in tok) or (bool(tok) and all(t in REFERENCES for t in tok))
+
+
+def ten_twenty_name(name):
+    return any(TEN_TWENTY.match(t) for t in name_tokens(name)) and not non_eeg_name(name)
+
+
+def eeg_channels(f, verbose=False):
+    """Names of the good EEG channels of a recording from its channels.tsv; None if there is no channels.tsv.
+    Channels typed EEG are kept unless their name marks another signal (EOG, EMG, ECG, SaO2, X1, ...); if no channel
+    is typed EEG, channels with a 10-20 electrode name are used. verbose: also return (dropped names, rule)."""
     tsv = channels_tsv(f)
     if tsv is None:
-        return None
-    rows = read_tsv(tsv)
-    return [r["name"] for r in rows if r.get("type", "").strip().upper() == "EEG"
-            and r.get("status", "good").strip().lower() != "bad"]
+        return (None, [], "no channels.tsv") if verbose else None
+    rows = [r for r in read_tsv(tsv) if r.get("status", "good").strip().lower() != "bad"]
+    typed = [r["name"] for r in rows if r.get("type", "").strip().upper() == "EEG"]
+    if typed:
+        keep, dropped, rule = [c for c in typed if not non_eeg_name(c)], [c for c in typed if non_eeg_name(c)], "type"
+    else:
+        names = [r["name"] for r in rows]
+        keep, dropped, rule = [c for c in names if ten_twenty_name(c)], [c for c in names if not ten_twenty_name(c)], \
+            "10-20 name"
+    return (keep, dropped, rule) if verbose else keep
 
 
 def sessions(root):
@@ -166,7 +203,7 @@ def scan(args, dataset):
         print(f"{dataset}: no sub-*/**/eeg/*_eeg.* files under {root}\n", flush=True)
         return
     fmt = Counter(os.path.splitext(f)[1] for _, f, _ in recs)
-    n_ch, types, missing = Counter(), Counter(), 0
+    n_ch, types, missing, kept, dropped, rules = Counter(), Counter(), 0, Counter(), Counter(), Counter()
     for _, f, _ in recs:
         tsv = channels_tsv(f)
         if tsv is None:
@@ -174,15 +211,21 @@ def scan(args, dataset):
             continue
         rows = read_tsv(tsv)
         types.update(r.get("type", "?").strip().upper() for r in rows)
-        n_ch[len(eeg_channels(f))] += 1
+        k, d, rule = eeg_channels(f, verbose=True)
+        n_ch[len(k)] += 1
+        kept.update(k)
+        dropped.update(d)
+        rules[rule] += 1
     print(f"{dataset}: {len(recs)} recordings of {len({m['sub'] for _, _, m in recs})} subjects under {root}")
     print(f"  formats {dict(fmt)}; splits {dict(Counter(m['split'] for _, _, m in recs))}")
     print(f"  channel types over all recordings {dict(types)}")
-    print(f"  EEG channels per recording {dict(sorted(n_ch.items()))}"
+    print(f"  EEG channels kept per recording {dict(sorted(n_ch.items()))} (selected by {dict(rules)})"
           + (f"; {missing} without channels.tsv (mne's EEG types will be used)" if missing else ""))
-    first = next((f for _, f, _ in recs if channels_tsv(f)), None)
-    if first:
-        print(f"  e.g. {os.path.basename(first)}: {eeg_channels(first)}")
+    fmt_names = lambda c: ", ".join(f"{k} ({v})" for k, v in c.most_common()) or "-"
+    print(f"  kept [name (recordings)]: {fmt_names(kept)}")
+    print(f"  dropped: {fmt_names(dropped)}")
+    if not kept:
+        print("  WARNING: no EEG channel found; this dataset would be skipped")
     print(flush=True)
 
 
@@ -223,7 +266,8 @@ def read_raw(f, channels):
     mne.set_log_level("ERROR")
     raw = mne.io.read_raw(f, preload=False)
     if channels is None:
-        channels = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True, exclude="bads")]
+        channels = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True, exclude="bads")
+                    if not non_eeg_name(raw.ch_names[i])]
     else:
         lookup = {c.strip().strip(".").lower(): c for c in raw.ch_names}  # eegmmidb-style padded labels
         channels = [lookup[c.strip().strip(".").lower()] for c in channels if c.strip().strip(".").lower() in lookup]
@@ -241,9 +285,14 @@ def prep_one(job):
     name, f, out, hann = job
     fx, fb = os.path.join(out, f"{name}.npy"), os.path.join(out, f"{name}_bad.npy")
     fc = os.path.join(out, f"{name}_channels.json")
+    norm = lambda names: [c.strip().strip(".").lower() for c in names]
     try:
-        if not (os.path.exists(fx) and os.path.exists(fb) and os.path.exists(fc)):
-            x, chs = read_raw(f, eeg_channels(f))
+        wanted = eeg_channels(f)
+        cached = os.path.exists(fx) and os.path.exists(fb) and os.path.exists(fc)
+        if cached and wanted is not None and norm(json.load(open(fc))) != norm(wanted):
+            cached = False  # cache built with another channel selection (e.g. before the name rules): redo
+        if not cached:
+            x, chs = read_raw(f, wanted)
             np.save(fb, bad_epochs(x))  # on the unsmoothed signal, as in the eval
             np.save(fx, smooth(x, hann).astype(np.float32))
             with open(fc, "w") as fh:
